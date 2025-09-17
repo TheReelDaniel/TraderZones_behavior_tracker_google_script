@@ -1,0 +1,400 @@
+/** ===== TraderZones One-Cell Journal (Google Apps Script) =====
+ * Headers auto-repair, guided entry, quick +Pos/+Neg, Toggle News,
+ * +1 / -1 Urge, and robust recalculation end-to-end.
+ */
+
+const CONFIG = {
+  SHEET_NAME: 'Journal',
+  weights: {
+    pos: 1.0,
+    neg: 1.5,
+    lossesBreakpoint: 2,
+    lossesPenalty: 1.5,
+    urgeBreakpoint: 7,
+    urgePenalty: 1.0,
+    sleepBreakpoint: 6,
+    sleepPenalty: 0.5,
+    newsPenalty: 2.0,
+    ruleBonus: 1.0
+  },
+  link: { cell: 'P1', text: 'copyright 2025 TraderZones', url: 'https://traderzones.com' },
+  zone: {
+    fractureMax: -5,
+    focusMax: 3
+  }
+};
+
+const HEADERS = [
+  'Timestamp', 'Setup', 'Urge(0-10)', 'Sleep(hrs)', 'LossesLastHr',
+  'News3min(Y/N)', 'RuleMatch(Y/N)', 'Pos(+1)', 'Neg(+1)',
+  'ScoreΔ', 'RunningScore', 'Zone'
+];
+
+/* ---------------- UI Menu ---------------- */
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('TraderZones')
+    .addItem('Initialize / Repair headers', 'initialize')
+    .addSeparator()
+    .addItem('New Entry (guided)', 'newEntry')
+    .addItem('Quick New (+ Positive)', 'quickNewPositive')
+    .addItem('Quick New (− Negative)', 'quickNewNegative')
+    .addSeparator()
+    .addItem('+Positive to current row', 'logPositive')
+    .addItem('+Negative to current row', 'logNegative')
+    .addSeparator()
+    .addItem('Toggle News Y/N (current row)', 'toggleNews')
+    .addItem('+1 Urge (current row)', 'urgeUp')
+    .addItem('-1 Urge (current row)', 'urgeDown')
+    .addSeparator()
+    .addItem('Recalculate all', 'recalcAll')
+    .addToUi();
+}
+
+
+/* --------------- Setup / Safety --------------- */
+
+function initialize() {
+  const sh = ensureSheetAndHeaders();
+  sh.activate();
+  recalcAll();
+}
+
+function getSheet() {
+  return ensureSheetAndHeaders();
+}
+
+function headerMap() {
+  // Fixed map: column index is based on HEADERS order (A..L)
+  const map = {};
+  HEADERS.forEach((h, i) => map[h] = i + 1);
+  return map;
+}
+
+function ensureSheetAndHeaders() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(CONFIG.SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEET_NAME);
+
+  const rng = sh.getRange(1, 1, 1, HEADERS.length);
+  const current = rng.getValues()[0].map(v => String(v || '').trim());
+  const needsWrite = current.length < HEADERS.length ||
+                     HEADERS.some((h, i) => current[i] !== h);
+
+  if (needsWrite) {
+    rng.setValues([HEADERS]);
+    sh.setFrozenRows(1);
+    sh.getRange('A:A').setNumberFormat('yyyy-mm-dd hh:mm');
+    sh.getRange('C:E').setNumberFormat('0.0');   // Urge, Sleep, Losses
+    sh.getRange('H:K').setNumberFormat('0.00');  // Pos, Neg, ScoreΔ, RunningScore
+    sh.autoResizeColumns(1, HEADERS.length);
+  }
+  placeBrandLink_(sh);
+  return sh;
+}
+
+/* --------------- Helpers --------------- */
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function yn(v) {
+  const s = String(v || '').trim().toUpperCase();
+  return s === 'Y' ? 'Y' : 'N';
+}
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function computeScoreDelta(r) {
+  const w = CONFIG.weights;
+  const pos = toNum(r.pos);
+  const neg = toNum(r.neg);
+  const losses = toNum(r.losses);
+  const urge = toNum(r.urge);
+  const sleep = toNum(r.sleep);
+  const newsY = yn(r.news) === 'Y';
+  const ruleY = yn(r.rule) === 'Y';
+
+  let score =
+    pos * w.pos -
+    neg * w.neg -
+    (losses >= w.lossesBreakpoint ? w.lossesPenalty : 0) -
+    (urge >= w.urgeBreakpoint ? w.urgePenalty : 0) -
+    (sleep < w.sleepBreakpoint ? w.sleepPenalty : 0) -
+    (newsY ? w.newsPenalty : 0) +
+    (ruleY ? w.ruleBonus : 0);
+
+  return Math.round(score * 100) / 100; // neat rounding
+}
+
+function zoneFromRunningScore(k) {
+  if (k < CONFIG.zone.fractureMax) return 'Fracture';
+  if (k < CONFIG.zone.focusMax) return 'Focus';
+  return 'Flow';
+}
+
+function emptyRow() {
+  const row = new Array(HEADERS.length).fill('');
+  row[0] = new Date(); // Timestamp
+  row[HEADERS.indexOf('Pos(+1)')] = 0;
+  row[HEADERS.indexOf('Neg(+1)')] = 0;
+  row[HEADERS.indexOf('ScoreΔ')] = 0;
+  row[HEADERS.indexOf('RunningScore')] = 0;
+  row[HEADERS.indexOf('Zone')] = 'Focus';
+  return row;
+}
+
+function currentDataRow(sh) {
+  // Ensure there is at least one data row (row 2)
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) return lastRow;
+  sh.getRange(2, 1, 1, HEADERS.length).setValues([emptyRow()]);
+  return 2;
+}
+
+/* --------------- Actions --------------- */
+
+function newEntry() {
+  const sh = getSheet();
+  const map = headerMap();
+
+  const ui = SpreadsheetApp.getUi();
+  const get = (title, def) => {
+    const res = ui.prompt('TraderZones — ' + title, 'Default: ' + def, ui.ButtonSet.OK_CANCEL);
+    if (res.getSelectedButton() !== ui.Button.OK) throw new Error('Canceled.');
+    return res.getResponseText().trim() || String(def);
+  };
+
+  const setup  = get('Setup (e.g., Opening Drive, Pullback to EMA, etc.)', '');
+  const urge   = toNum(get('Urge (0-10)', 5));
+  const sleep  = toNum(get('Sleep hours (e.g., 7.5)', 7));
+  const losses = toNum(get('Losses in last hour (count)', 0));
+  const news   = yn(get('Within 3min of high-impact news? (Y/N)', 'N'));
+  const rule   = yn(get('Does this match a written rule? (Y/N)', 'Y'));
+  const pos    = toNum(get('Positive micro-actions (count)', 1));
+  const neg    = toNum(get('Negative micro-actions (count)', 0));
+
+  const scoreDelta = computeScoreDelta({ pos, neg, losses, urge, sleep, news, rule });
+
+  const lastRow = Math.max(sh.getLastRow(), 1);
+  const row = lastRow + 1;
+
+  // Fixed-length write so no range mismatch
+  const values = new Array(HEADERS.length).fill('');
+  values[map['Timestamp'] - 1]      = new Date();
+  values[map['Setup'] - 1]          = setup;
+  values[map['Urge(0-10)'] - 1]     = urge;
+  values[map['Sleep(hrs)'] - 1]     = sleep;
+  values[map['LossesLastHr'] - 1]   = losses;
+  values[map['News3min(Y/N)'] - 1]  = news;
+  values[map['RuleMatch(Y/N)'] - 1] = rule;
+  values[map['Pos(+1)'] - 1]        = pos;
+  values[map['Neg(+1)'] - 1]        = neg;
+  values[map['ScoreΔ'] - 1]         = scoreDelta;
+  // RunningScore + Zone will be filled by recalcAll()
+
+  sh.getRange(row, 1, 1, HEADERS.length).setValues([values]);
+  recalcAll();
+}
+
+function logPositive() { logBehaviorDelta({ posDelta: 1, negDelta: 0 }); }
+function logNegative() { logBehaviorDelta({ posDelta: 0, negDelta: 1 }); }
+
+function logBehaviorDelta({ posDelta = 0, negDelta = 0 }) {
+  const sh = getSheet();
+  const map = headerMap();
+  const row = currentDataRow(sh);
+
+  const posRange = sh.getRange(row, map['Pos(+1)']);
+  const negRange = sh.getRange(row, map['Neg(+1)']);
+  const losses   = toNum(sh.getRange(row, map['LossesLastHr']).getValue());
+  const urge     = toNum(sh.getRange(row, map['Urge(0-10)']).getValue());
+  const sleep    = toNum(sh.getRange(row, map['Sleep(hrs)']).getValue());
+  const news     = yn(sh.getRange(row, map['News3min(Y/N)']).getValue());
+  const rule     = yn(sh.getRange(row, map['RuleMatch(Y/N)']).getValue());
+
+  const pos = toNum(posRange.getValue()) + posDelta;
+  const neg = toNum(negRange.getValue()) + negDelta;
+
+  posRange.setValue(pos);
+  negRange.setValue(neg);
+
+  const scoreDelta = computeScoreDelta({ pos, neg, losses, urge, sleep, news, rule });
+  sh.getRange(row, map['ScoreΔ']).setValue(scoreDelta);
+
+  recalcRunningAndZones();
+}
+
+/* --------------- Quick Toggles --------------- */
+
+function toggleNews() {
+  const sh = getSheet();
+  const map = headerMap();
+  const row = currentDataRow(sh);
+
+  const cur = yn(sh.getRange(row, map['News3min(Y/N)']).getValue());
+  const next = cur === 'Y' ? 'N' : 'Y';
+  sh.getRange(row, map['News3min(Y/N)']).setValue(next);
+
+  // Recompute ScoreΔ for this row
+  const pos = toNum(sh.getRange(row, map['Pos(+1)']).getValue());
+  const neg = toNum(sh.getRange(row, map['Neg(+1)']).getValue());
+  const losses = toNum(sh.getRange(row, map['LossesLastHr']).getValue());
+  const urge = toNum(sh.getRange(row, map['Urge(0-10)']).getValue());
+  const sleep = toNum(sh.getRange(row, map['Sleep(hrs)']).getValue());
+  const rule = yn(sh.getRange(row, map['RuleMatch(Y/N)']).getValue());
+  const scoreDelta = computeScoreDelta({ pos, neg, losses, urge, sleep, news: next, rule });
+  sh.getRange(row, map['ScoreΔ']).setValue(scoreDelta);
+
+  recalcRunningAndZones();
+}
+
+function urgeUp()  { adjustUrgeBy(+1); }
+function urgeDown(){ adjustUrgeBy(-1); }
+
+function adjustUrgeBy(delta) {
+  const sh = getSheet();
+  const map = headerMap();
+  const row = currentDataRow(sh);
+
+  const cur = toNum(sh.getRange(row, map['Urge(0-10)']).getValue());
+  const next = clamp(cur + delta, 0, 10);
+  sh.getRange(row, map['Urge(0-10)']).setValue(next);
+
+  // Recompute ScoreΔ for this row
+  const pos = toNum(sh.getRange(row, map['Pos(+1)']).getValue());
+  const neg = toNum(sh.getRange(row, map['Neg(+1)']).getValue());
+  const losses = toNum(sh.getRange(row, map['LossesLastHr']).getValue());
+  const sleep = toNum(sh.getRange(row, map['Sleep(hrs)']).getValue());
+  const news = yn(sh.getRange(row, map['News3min(Y/N)']).getValue());
+  const rule = yn(sh.getRange(row, map['RuleMatch(Y/N)']).getValue());
+  const scoreDelta = computeScoreDelta({ pos, neg, losses, urge: next, sleep, news, rule });
+  sh.getRange(row, map['ScoreΔ']).setValue(scoreDelta);
+
+  recalcRunningAndZones();
+}
+
+/* --------------- Recalculation --------------- */
+
+function recalcAll() {
+  const sh = getSheet();
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const numRows = last - 1;
+  const rng = sh.getRange(2, 1, numRows, HEADERS.length);
+  const data = rng.getValues();
+
+  let running = 0;
+  const idx = Object.fromEntries(HEADERS.map((h, i) => [h, i]));
+
+  for (let i = 0; i < data.length; i++) {
+    const r = data[i];
+
+    const urge   = r[idx['Urge(0-10)']];
+    const sleep  = r[idx['Sleep(hrs)']];
+    const losses = r[idx['LossesLastHr']];
+    const news   = r[idx['News3min(Y/N)']];
+    const rule   = r[idx['RuleMatch(Y/N)']];
+    const pos    = r[idx['Pos(+1)']];
+    const neg    = r[idx['Neg(+1)']];
+
+    const sd = computeScoreDelta({ pos, neg, losses, urge, sleep, news, rule });
+    r[idx['ScoreΔ']] = sd;
+
+    running += sd;
+    const rrun = Math.round(running * 100) / 100;
+    r[idx['RunningScore']] = rrun;
+    r[idx['Zone']] = zoneFromRunningScore(rrun);
+  }
+
+  rng.setValues(data);
+}
+//
+function placeBrandLink_(sh) {
+  const rng = sh.getRange(CONFIG.link.cell);
+  if (!String(rng.getDisplayValue()).trim()) {
+    const rich = SpreadsheetApp.newRichTextValue()
+      .setText(CONFIG.link.text)
+      .setLinkUrl(CONFIG.link.url)
+      .build();
+    rng.setRichTextValue(rich)
+       .setFontWeight('bold')
+       .setHorizontalAlignment('right')
+       .setFontColor('#2563eb'); // optional brand color
+  }
+}
+
+
+function recalcRunningAndZones() {
+  const sh = getSheet();
+  const map = headerMap();
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const numRows = last - 1;
+  const sd = sh.getRange(2, map['ScoreΔ'], numRows, 1).getValues().map(r => toNum(r[0]));
+  const k = new Array(numRows);
+  const z = new Array(numRows);
+
+  let running = 0;
+  for (let i = 0; i < numRows; i++) {
+    running += sd[i];
+    const rrun = Math.round(running * 100) / 100;
+    k[i] = [rrun];
+    z[i] = [zoneFromRunningScore(rrun)];
+  }
+  sh.getRange(2, map['RunningScore'], numRows, 1).setValues(k);
+  sh.getRange(2, map['Zone'],         numRows, 1).setValues(z);
+}
+function quickNewPositive(){ quickNew({pos:1, neg:0}); }
+function quickNewNegative(){ quickNew({pos:0, neg:1}); }
+
+function quickNew({pos=1, neg=0}) {
+  const sh = getSheet();
+  const map = headerMap();
+  const lastRow = Math.max(sh.getLastRow(), 1);
+
+  // Defaults; copy from last row when available
+  let defaults = { setup:'', urge:5, sleep:7, losses:0, news:'N', rule:'Y' };
+  if (lastRow >= 2) {
+    const idx = Object.fromEntries(HEADERS.map((h,i)=>[h,i]));
+    const r = sh.getRange(lastRow, 1, 1, HEADERS.length).getValues()[0];
+    defaults = {
+      setup: r[idx['Setup']] || '',
+      urge:  toNum(r[idx['Urge(0-10)']]) || 5,
+      sleep: toNum(r[idx['Sleep(hrs)']]) || 7,
+      losses: 0,
+      news:  yn(r[idx['News3min(Y/N)']]) || 'N',
+      rule:  yn(r[idx['RuleMatch(Y/N)']]) || 'Y'
+    };
+  }
+
+  const scoreDelta = computeScoreDelta({
+    pos, neg,
+    losses: defaults.losses,
+    urge: defaults.urge,
+    sleep: defaults.sleep,
+    news: defaults.news,
+    rule: defaults.rule
+  });
+
+  const values = new Array(HEADERS.length).fill('');
+  values[map['Timestamp'] - 1]      = new Date();
+  values[map['Setup'] - 1]          = defaults.setup;
+  values[map['Urge(0-10)'] - 1]     = defaults.urge;
+  values[map['Sleep(hrs)'] - 1]     = defaults.sleep;
+  values[map['LossesLastHr'] - 1]   = defaults.losses;
+  values[map['News3min(Y/N)'] - 1]  = defaults.news;
+  values[map['RuleMatch(Y/N)'] - 1] = defaults.rule;
+  values[map['Pos(+1)'] - 1]        = pos;
+  values[map['Neg(+1)'] - 1]        = neg;
+  values[map['ScoreΔ'] - 1]         = scoreDelta;
+
+  sh.getRange(lastRow + 1, 1, 1, HEADERS.length).setValues([values]);
+  recalcAll();
+}
+
